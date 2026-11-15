@@ -5,8 +5,9 @@ using SevenZip.Compression.LZMA;
 namespace NyaXZ
 {
     /// <summary>
-    /// Managed XZ (.xz) decompressor. Handles a single-stream XZ with LZMA2-filtered
-    /// blocks and CRC32/CRC64/SHA-256/None checks (checks are skipped, not verified).
+    /// XZ (.xz) decompressor. Uses SharpCompress for the primary LZMA2 decode and
+    /// keeps the small managed decoder as a fallback for simple single-block streams.
+    /// Checks are not verified.
     /// </summary>
     public static class XzDecompressor
     {
@@ -16,6 +17,29 @@ namespace NyaXZ
         {
             if (Data == null) throw new ArgumentNullException(nameof(Data));
 
+            try
+            {
+                return DecompressSharpCompress(Data);
+            }
+            catch (Exception)
+            {
+                return DecompressManaged(Data);
+            }
+        }
+
+        private static byte[] DecompressSharpCompress(byte[] Data)
+        {
+            using (var In = new MemoryStream(Data, false))
+            using (var Xz = new SharpCompress.Compressors.Xz.XZStream(In))
+            using (var Out = new MemoryStream())
+            {
+                Xz.CopyTo(Out);
+                return Out.ToArray();
+            }
+        }
+
+        private static byte[] DecompressManaged(byte[] Data)
+        {
             if ((Data.Length < 24) ||
                 (Data[0] != 0xFD) || (Data[1] != 0x37) || (Data[2] != 0x7A) ||
                 (Data[3] != 0x58) || (Data[4] != 0x5A) || (Data[5] != 0x00))

@@ -7,7 +7,7 @@
     <RepositoryUrl>https://github.com/teplofizik/nyaxz</RepositoryUrl>
     <Description>.NET XZ (LZMA2) compress/decompress library</Description>
     <LangVersion>latest</LangVersion>
-    <Version>1.0.1</Version>
+    <Version>1.0.3</Version>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <PackageReference Include="LZMA-SDK" Version="19.0.0" />
+    <PackageReference Include="SharpCompress" Version="0.50.5" />
   </ItemGroup>
 
 </Project>
