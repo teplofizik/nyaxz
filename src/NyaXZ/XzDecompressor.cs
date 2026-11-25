@@ -1,44 +1,28 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
-using SevenZip.Compression.LZMA;
+using System.Security.Cryptography;
 
 namespace NyaXZ
 {
     /// <summary>
-    /// XZ (.xz) decompressor. Uses SharpCompress for the primary LZMA2 decode and
-    /// keeps the small managed decoder as a fallback for simple single-block streams.
-    /// Checks are not verified.
+    /// Managed XZ (.xz) decoder: parses the container and block filter chains and
+    /// decodes stateful LZMA2 with delta/BCJ filters. Block checks are verified.
     /// </summary>
     public static class XzDecompressor
     {
-        private const int Lzma2FilterId = 0x21;
+        private const ulong Lzma2FilterId = 0x21;
+        private const ulong DeltaFilterId = 0x03;
+        private const int MaxDictionarySize = 256 * 1024 * 1024;
 
         public static byte[] Decompress(byte[] Data)
         {
             if (Data == null) throw new ArgumentNullException(nameof(Data));
 
-            try
-            {
-                return DecompressSharpCompress(Data);
-            }
-            catch (Exception)
-            {
-                return DecompressManaged(Data);
-            }
+            return DecompressXz(Data);
         }
 
-        private static byte[] DecompressSharpCompress(byte[] Data)
-        {
-            using (var In = new MemoryStream(Data, false))
-            using (var Xz = new SharpCompress.Compressors.Xz.XZStream(In))
-            using (var Out = new MemoryStream())
-            {
-                Xz.CopyTo(Out);
-                return Out.ToArray();
-            }
-        }
-
-        private static byte[] DecompressManaged(byte[] Data)
+        private static byte[] DecompressXz(byte[] Data)
         {
             if ((Data.Length < 24) ||
                 (Data[0] != 0xFD) || (Data[1] != 0x37) || (Data[2] != 0x7A) ||
@@ -46,40 +30,158 @@ namespace NyaXZ
                 throw new InvalidDataException("Not an XZ stream");
 
             int CheckSize = GetCheckSize(Data[7]);
+            var Result = new MemoryStream();
+            int Pos = 12;
 
-            using (var Out = new MemoryStream())
+            while (Pos < Data.Length)
             {
-                int Pos = 12;
+                int BlockStart = Pos;
+                byte SizeByte = Data[Pos++];
 
-                while (Pos < Data.Length)
+                if (SizeByte == 0x00)
+                    break; // index indicator: no more blocks
+
+                int HeaderSize = (SizeByte + 1) * 4;
+                int HeaderEnd = BlockStart + HeaderSize;
+
+                if ((HeaderSize < 8) || (HeaderEnd > Data.Length))
+                    throw new InvalidDataException("Truncated XZ block header");
+
+                int BodyEnd = HeaderEnd - 4;
+                byte Flags = Data[Pos++];
+                int FilterCount = (Flags & 0x03) + 1;
+
+                if ((Flags & 0x3C) != 0)
+                    throw new InvalidDataException("Unsupported XZ block flags");
+
+                bool HasCompressedSize = (Flags & 0x40) != 0;
+                bool HasUncompressedSize = (Flags & 0x80) != 0;
+                ulong CompressedSize = 0;
+                ulong UncompressedSize = 0;
+
+                if (HasCompressedSize)
+                    CompressedSize = Varint.Read(Data, ref Pos);
+
+                if (HasUncompressedSize)
+                    UncompressedSize = Varint.Read(Data, ref Pos);
+
+                var Filters = new List<(ulong Id, byte[] Properties)>(FilterCount);
+                for (int i = 0; i < FilterCount; i++)
                 {
-                    if (Data[Pos] == 0x00)
-                        break; // index indicator: no more blocks
+                    ulong Id = Varint.Read(Data, ref Pos);
+                    ulong PropertySize = Varint.Read(Data, ref Pos);
 
-                    int HeaderSize = (Data[Pos] + 1) * 4;
-                    int BlockStart = Pos;
-                    int DataStart = Pos + HeaderSize;
+                    if (PropertySize > Int32.MaxValue)
+                        throw new InvalidDataException("XZ filter properties too large");
 
-                    byte FilterId;
-                    byte[] FilterProps;
-                    ParseBlockHeader(Data, Pos, out FilterId, out FilterProps);
-
-                    if (FilterId != Lzma2FilterId)
-                        throw new InvalidDataException($"Unsupported XZ filter 0x{FilterId:X2}");
-
-                    Pos = DataStart;
-                    DecodeLzma2(Data, ref Pos, FilterProps[0], Out);
-
-                    int Lzma2Len = Pos - DataStart;
-                    int Pad = (4 - ((HeaderSize + Lzma2Len) % 4)) % 4;
-                    Pos += Pad + CheckSize;
-
-                    if (Pos <= BlockStart)
-                        throw new InvalidDataException("XZ block parse did not advance");
+                    var Properties = new byte[(int)PropertySize];
+                    Array.Copy(Data, Pos, Properties, 0, Properties.Length);
+                    Pos += Properties.Length;
+                    Filters.Add((Id, Properties));
                 }
 
-                return Out.ToArray();
+                if (Pos > BodyEnd)
+                    throw new InvalidDataException("XZ block header overflow");
+
+                for (int i = Pos; i < BodyEnd; i++)
+                {
+                    if (Data[i] != 0)
+                        throw new InvalidDataException("XZ block header padding is not zero");
+                }
+
+                uint HeaderCrc = ReadUInt32LE(Data, BodyEnd);
+                if (HeaderCrc != Crc32.Compute(Data, BlockStart, HeaderSize - 4))
+                    throw new InvalidDataException("XZ block header CRC mismatch");
+
+                if ((Filters.Count == 0) || (Filters[Filters.Count - 1].Id != Lzma2FilterId))
+                    throw new InvalidDataException("XZ block has no trailing LZMA2 filter");
+
+                Pos = HeaderEnd;
+                int DataStart = Pos;
+
+                int DictionarySize = GetLzma2DictionarySize(Filters[Filters.Count - 1].Properties);
+                byte[] Block;
+                int Consumed;
+
+                using (var Input = new MemoryStream(Data, DataStart, Data.Length - DataStart, false))
+                using (var BlockOut = new MemoryStream())
+                {
+                    new Lzma2Decoder(DictionarySize).Decode(Input, BlockOut);
+                    Consumed = (int)Input.Position;
+                    Block = BlockOut.ToArray();
+                }
+
+                for (int i = Filters.Count - 2; i >= 0; i--)
+                    ApplyFilter(Filters[i].Id, Filters[i].Properties, Block);
+
+                if (HasCompressedSize && ((ulong)Consumed != CompressedSize))
+                    throw new InvalidDataException("XZ block compressed size mismatch");
+
+                if (HasUncompressedSize && ((ulong)Block.Length != UncompressedSize))
+                    throw new InvalidDataException("XZ block uncompressed size mismatch");
+
+                int DataEnd = DataStart + Consumed;
+                int Padding = (DataEnd - BlockStart) % 4;
+
+                if (Padding != 0)
+                {
+                    int Skip = 4 - Padding;
+                    for (int i = 0; i < Skip; i++, DataEnd++)
+                    {
+                        if (Data[DataEnd] != 0)
+                            throw new InvalidDataException("XZ block padding is not zero");
+                    }
+                }
+
+                if (DataEnd + CheckSize > Data.Length)
+                    throw new InvalidDataException("Truncated XZ block check");
+
+                VerifyCheck(Data, DataEnd, CheckSize, Block);
+                Pos = DataEnd + CheckSize;
+
+                Result.Write(Block, 0, Block.Length);
             }
+
+            return Result.ToArray();
+        }
+
+        private static int GetLzma2DictionarySize(byte[] Properties)
+        {
+            if (Properties.Length != 1)
+                throw new InvalidDataException("Invalid LZMA2 filter properties");
+
+            byte Code = Properties[0];
+            if ((Code & 0xC0) != 0)
+                throw new InvalidDataException("Reserved bits set in LZMA2 properties");
+
+            Code &= 0x3F;
+            if (Code > 40)
+                throw new InvalidDataException("Invalid LZMA2 dictionary code");
+
+            long Size = (long)(2 | (Code & 1)) << ((Code >> 1) + 11);
+            if ((Size <= 0) || (Size > MaxDictionarySize))
+                throw new InvalidDataException($"LZMA2 dictionary too large: {Size}");
+
+            return (int)Size;
+        }
+
+        private static void ApplyFilter(ulong Id, byte[] Properties, byte[] Block)
+        {
+            if (Id == DeltaFilterId)
+            {
+                if (Properties.Length != 1)
+                    throw new InvalidDataException("Invalid delta filter properties");
+                XzFilters.Delta(Block, Properties[0] + 1);
+                return;
+            }
+
+            if ((Id >= 0x04) && (Id <= 0x09))
+            {
+                XzFilters.Apply(Id, Properties, Block);
+                return;
+            }
+
+            throw new InvalidDataException($"Unsupported XZ filter 0x{Id:X2}");
         }
 
         private static int GetCheckSize(byte StreamFlags)
@@ -94,89 +196,44 @@ namespace NyaXZ
             }
         }
 
-        private static void ParseBlockHeader(byte[] Data, int Pos, out byte FilterId, out byte[] FilterProps)
+        private static void VerifyCheck(byte[] Data, int Offset, int CheckSize, byte[] Block)
         {
-            int HeaderSize = (Data[Pos] + 1) * 4;
-            int P = Pos + 2; // skip size byte and block flags
-
-            FilterId = (byte)Varint.Read(Data, ref P);
-            int PropsSize = (int)Varint.Read(Data, ref P);
-            FilterProps = new byte[PropsSize];
-            Array.Copy(Data, P, FilterProps, 0, PropsSize);
-
-            if ((FilterId != Lzma2FilterId) || (PropsSize != 1))
-                throw new InvalidDataException("Only the LZMA2 filter is supported");
-
-            _ = HeaderSize;
-        }
-
-        private static long DictionarySize(byte Code) => (long)(2 | (Code & 1)) << ((Code >> 1) + 11);
-
-        private static byte[] CoderProperties(byte Lclppb, long DictionarySize)
-        {
-            var Res = new byte[5];
-            Res[0] = Lclppb;
-            Res[1] = (byte)(DictionarySize & 0xFF);
-            Res[2] = (byte)((DictionarySize >> 8) & 0xFF);
-            Res[3] = (byte)((DictionarySize >> 16) & 0xFF);
-            Res[4] = (byte)((DictionarySize >> 24) & 0xFF);
-            return Res;
-        }
-
-        private static void DecodeLzma2(byte[] Data, ref int Pos, byte DictionaryCode, MemoryStream Out)
-        {
-            long DictSize = DictionarySize(DictionaryCode);
-            var Decoder = new Decoder();
-            byte Lclppb = 0;
-            bool HasProps = false;
-
-            while (true)
+            switch (CheckSize)
             {
-                byte Control = Data[Pos++];
-
-                if (Control == 0x00)
+                case 0:
                     return;
 
-                if (Control < 0x80)
-                {
-                    if (Control > 0x02)
-                        throw new InvalidDataException($"Invalid LZMA2 control 0x{Control:X2}");
+                case 4:
+                    if (ReadUInt32LE(Data, Offset) != Crc32.Compute(Block))
+                        throw new InvalidDataException("XZ block CRC32 mismatch");
+                    return;
 
-                    int Size = ((Data[Pos] << 8) | Data[Pos + 1]) + 1;
-                    Pos += 2;
-                    Out.Write(Data, Pos, Size);
-                    Pos += Size;
-                    continue;
-                }
+                case 8:
+                    if (ReadUInt64LE(Data, Offset) != Crc64.Compute(Block))
+                        throw new InvalidDataException("XZ block CRC64 mismatch");
+                    return;
 
-                int Uncompressed = ((Control & 0x1F) << 16) + ((Data[Pos] << 8) | Data[Pos + 1]) + 1;
-                Pos += 2;
-                int Compressed = ((Data[Pos] << 8) | Data[Pos + 1]) + 1;
-                Pos += 2;
+                case 32:
+                    using (var Sha = SHA256.Create())
+                    {
+                        var Expected = Sha.ComputeHash(Block);
+                        for (int i = 0; i < Expected.Length; i++)
+                        {
+                            if (Data[Offset + i] != Expected[i])
+                                throw new InvalidDataException("XZ block SHA-256 mismatch");
+                        }
+                    }
+                    return;
 
-                if ((Control & 0x40) != 0)
-                {
-                    Lclppb = Data[Pos++];
-                    HasProps = true;
-                }
-
-                if (!HasProps)
-                    throw new InvalidDataException("LZMA2 chunk without properties");
-
-                // 0xA0/0xC0/0xE0 reset the LZMA state; 0x80 continues it.
-                if ((Control & 0x60) != 0)
-                {
-                    Decoder = new Decoder();
-                    Decoder.SetDecoderProperties(CoderProperties(Lclppb, DictSize));
-                }
-
-                using (var In = new MemoryStream(Data, Pos, Compressed, false))
-                {
-                    Decoder.Code(In, Out, Compressed, Uncompressed, null);
-                }
-
-                Pos += Compressed;
+                default:
+                    throw new InvalidDataException("Unsupported XZ check size");
             }
         }
+
+        private static uint ReadUInt32LE(byte[] Data, int Offset) =>
+            (uint)(Data[Offset] | (Data[Offset + 1] << 8) | (Data[Offset + 2] << 16) | (Data[Offset + 3] << 24));
+
+        private static ulong ReadUInt64LE(byte[] Data, int Offset) =>
+            (ulong)ReadUInt32LE(Data, Offset) | ((ulong)ReadUInt32LE(Data, Offset + 4) << 32);
     }
 }

@@ -12,8 +12,17 @@ namespace NyaXZ
     /// </summary>
     internal static class Lzma2
     {
-        /// <summary>Uncompressed chunk size (keeps both size fields within 16 bits).</summary>
-        public const int MaxChunkSize = 1 << 16;
+        /// <summary>Maximum packed size of one LZMA2 compressed chunk (16-bit field + 1).</summary>
+        public const int MaxPackedSize = 1 << 16;
+
+        /// <summary>Maximum unpacked size of one LZMA2 compressed chunk (21-bit field + 1).</summary>
+        public const int MaxUnpackedSize = 1 << 21;
+
+        /// <summary>Uncompressed chunk size used for incompressible data.</summary>
+        public const int MaxChunkSize = MaxPackedSize;
+
+        private const int MinChunkSize = 4096;
+        private const int StartChunkSize = 1 << 17;
 
         private static readonly CoderPropID[] PropIds =
         {
@@ -52,19 +61,40 @@ namespace NyaXZ
                 bool First = true;
                 int Pos = 0;
 
+                // Packed/unpacked ratio of the last compressed chunk. It lets us
+                // pick the largest chunk that still fits into MaxPackedSize, so
+                // fewer LZMA model resets are needed per SquashFS block.
+                double Ratio = 0;
+
                 while (Pos < Data.Length)
                 {
-                    int Len = Math.Min(MaxChunkSize, Data.Length - Pos);
+                    int Remaining = Data.Length - Pos;
+
+                    int Len = (Ratio > 0)
+                        ? (int)(MaxPackedSize * 0.98 / Ratio)
+                        : StartChunkSize;
+                    Len = Math.Max(MinChunkSize, Math.Min(Remaining, Math.Min(MaxUnpackedSize, Len)));
+                    Len = Math.Min(Len, Remaining);
 
                     byte[] Compressed;
-                    using (var In = new MemoryStream(Data, Pos, Len, false))
-                    using (var Chunk = new MemoryStream())
+                    while (true)
                     {
-                        CreateEncoder(DictionarySize).Code(In, Chunk, Len, Len, null);
-                        Compressed = Chunk.ToArray();
+                        Compressed = CompressChunk(Data, Pos, Len, DictionarySize);
+
+                        if ((Compressed.Length < Len) && (Compressed.Length <= MaxPackedSize))
+                            break;
+
+                        // Incompressible at this size: do not shrink, store it raw.
+                        if ((Compressed.Length >= Len) || (Len <= MinChunkSize))
+                        {
+                            Compressed = null;
+                            break;
+                        }
+
+                        Len = Math.Max(MinChunkSize, (int)(Len * 0.75));
                     }
 
-                    if ((Compressed.Length < Len) && (Compressed.Length <= MaxChunkSize))
+                    if (Compressed != null)
                     {
                         int UncompM1 = Len - 1;
                         int CompM1 = Compressed.Length - 1;
@@ -76,23 +106,42 @@ namespace NyaXZ
                         Out.WriteByte((byte)(CompM1 & 0xFF));
                         Out.WriteByte(Lclppb);
                         Out.Write(Compressed, 0, Compressed.Length);
+
+                        double ChunkRatio = (double)Compressed.Length / Len;
+                        Ratio = (Ratio > 0) ? (Ratio * 0.5 + ChunkRatio * 0.5) : ChunkRatio;
+
+                        Pos += Len;
                     }
                     else
                     {
-                        int SizeM1 = Len - 1;
+                        int Size = Math.Min(Remaining, MaxChunkSize);
+                        int SizeM1 = Size - 1;
+
                         Out.WriteByte((byte)(First ? 0x01 : 0x02));
                         Out.WriteByte((byte)((SizeM1 >> 8) & 0xFF));
                         Out.WriteByte((byte)(SizeM1 & 0xFF));
-                        Out.Write(Data, Pos, Len);
+                        Out.Write(Data, Pos, Size);
+
+                        Ratio = 1.0;
+                        Pos += Size;
                     }
 
                     First = false;
-                    Pos += Len;
                 }
 
                 Out.WriteByte(0x00); // end of LZMA2 stream
 
                 return Out.ToArray();
+            }
+        }
+
+        private static byte[] CompressChunk(byte[] Data, int Pos, int Len, int DictionarySize)
+        {
+            using (var In = new MemoryStream(Data, Pos, Len, false))
+            using (var Chunk = new MemoryStream())
+            {
+                CreateEncoder(DictionarySize).Code(In, Chunk, Len, Len, null);
+                return Chunk.ToArray();
             }
         }
     }
